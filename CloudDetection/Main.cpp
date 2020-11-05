@@ -10,16 +10,109 @@ using namespace cv::xfeatures2d;
 using namespace std;
 
 //const string VIDEO_PATH = "D:/NIFA/lamberton_08_10_2020/DJI_0001.MOV";
-//const string VIDEO_PATH = "D:/NIFA/elgin_07_27_2020/DJI_0004.MOV";
-//const string VIDEO_PATH = "D:/NIFA/becker_07_24_2020/DJI_0004.MOV";
+//const string VIDEO_PATH = "E:/NIFA/footage/elgin_07_27_2020/DJI_0004.MOV";
+const string VIDEO_PATH = "E:/NIFA/footage/grand_meadow_07_08_2020/DJI_0001.MOV";
+// const string VIDEO_PATH = "E:/NIFA/becker_07_24_2020/DJI_0004.MOV";
 //const string VIDEO_PATH = "D:/NIFA/elgin_07_27_2020/DJI_0001.MOV";
-const string VIDEO_PATH = "D:/NIFA/lamberton_08_10_2020/DJI_0001.MOV";
-const string ROT_REF_PATH = "D:/NIFA/rotation_test_images/reference.jpg";
-const string ROT_ROTATED_PATH = "D:/NIFA/rotation_test_images/rotated.jpg";
+//const string VIDEO_PATH = "D:/NIFA/lamberton_08_10_2020/DJI_0001.MOV";
+//const string ROT_REF_PATH = "D:/NIFA/rotation_test_images/reference.jpg";
+//const string ROT_ROTATED_PATH = "D:/NIFA/rotation_test_images/rotated.jpg";
 
-string OMNI_MODEL_PATH = "D:/NIFA/omnidir_model_full.xml";
+string OMNI_MODEL_PATH = "E:/NIFA/calibration/camera_models/live_fisheye_model.xml";
+const string GCP_LOCATION = "E:/NIFA/footage/grand_meadow_07_08_2020/";
+const string GCP_PATH = GCP_LOCATION + "gcp.xml";
+const string GCP_PIXEL_COORDS_PATH = GCP_LOCATION + "pixel_coords.xml";
 
-const float RESIZE_FACTOR = 1.5;
+
+//const float RESIZE_FACTOR = 1.5;
+
+// Get image coordinates of fiducial markers defined in GCP_PATH
+static void markFiducials(Mat& world_coords, vector<Point2f>& pixel_coords) {
+	FileStorage gcp_read(GCP_PATH, FileStorage::READ);
+	gcp_read["gcp"] >> world_coords;
+
+	FileStorage fs(GCP_PIXEL_COORDS_PATH, FileStorage::READ);
+	if (fs.isOpened()) {
+		fs["pixel_coords"] >> pixel_coords;
+	}
+}
+
+// Get camera pose via PNP solver
+static void estimateCameraPose(const Mat& world_coords, const vector<Point2f>& pixel_coords, const Mat& K, const Mat& D, Mat& rvec, Mat& tvec, vector<Point2d>& new_pixel_coords) {
+	solvePnPRansac(world_coords, pixel_coords, K, D, rvec, tvec);
+	projectPoints(world_coords, rvec, tvec, K, D, new_pixel_coords);
+}
+
+// Helper function: Get evenly spaced coordinates on a line between two points
+void generateLineCoordinatesHelper(const Point3f& start, const Point3f& end, int numCoords, vector<Point3f>& line_coords) {
+	if (start.x == end.x) {
+		float total_distance = end.y - start.y;
+		for (float i = 0; i < numCoords; i++) {
+			float frac = i / (numCoords - 1);
+			line_coords.push_back(Point3f(start.x, start.y + frac * total_distance, 0));
+		}
+	}
+	else if (start.y == end.y) {
+		float total_distance = end.x - start.x;
+		for (float i = 0; i < numCoords; i++) {
+			float frac = i / (numCoords - 1);
+			line_coords.push_back(Point3f(start.x + frac * total_distance, start.y, 0));
+		}
+	}
+	else {
+		cout << "One set of corresponding coordinates must be equal." << endl;
+	}
+}
+
+
+// Get coordinates for sampling on East-North plane
+void generateENZPlaneCoordinates(const Point3f& min_corner, const Point3f& max_corner, const Size& size, Mat& K, Mat& D, Mat& rvec, Mat& tvec, vector<Point2f>& new_enz_coords) {
+	Point3f top_left = Point3f(min_corner.x, max_corner.y, min_corner.z);
+	vector<Point3f> left_edge;
+	generateLineCoordinatesHelper(min_corner, top_left, size.height, left_edge);
+	vector<Point3f> enz_coords;
+	for (int i = 0; i < left_edge.size(); i++) {
+		vector<Point3f> row;
+		generateLineCoordinatesHelper(left_edge[i], Point3f(max_corner.x, left_edge[i].y, min_corner.z), size.width, row);
+
+		for (int j = 0; j < row.size(); j++) {
+			enz_coords.push_back(row[j]);
+		}
+	}
+	projectPoints(enz_coords, rvec, tvec, K, D, new_enz_coords);
+}
+
+// Helper function: Bilinear interpolation for image pixels
+cv::Vec3b getColorSubpixHelper(const cv::Mat& img, cv::Point2f pt)
+{
+	cv::Mat patch;
+	cv::getRectSubPix(img, cv::Size(1, 1), pt, patch);
+	return patch.at<cv::Vec3b>(0, 0);
+}
+
+// Get and display ENZ sampling region coordinates
+void getSamplingRegion(const Mat& frame, Point3f& min_corner, Point3f& max_corner, Size dim, Mat& K, Mat& D, Mat& rvec, Mat& tvec, bool show, vector<Point2f>& enz_coords) {
+	generateENZPlaneCoordinates(min_corner, max_corner, dim, K, D, rvec, tvec, enz_coords);
+	if (show) {
+		for (int i = 0; i < enz_coords.size(); i++) {
+			circle(frame, enz_coords[i], 3, Scalar(255, 0, 0), -1);
+		}
+		//imshow("Sampling region", frame);
+	}
+}
+
+// Get image resampled to ENZ
+void getRegisteredImage(const Mat& frame, vector<Point2f>& enz_coords, bool show, Mat& new_frame) {
+	vector<Vec3b> registered;
+	for (int i = 0; i < enz_coords.size(); i++) {
+		registered.push_back(getColorSubpixHelper(frame, enz_coords[i]));
+	}
+	new_frame = Mat(registered).reshape(3, 1400);
+	rotate(new_frame, new_frame, ROTATE_90_COUNTERCLOCKWISE);
+	if (show) {
+		imshow("Registered and resampled", new_frame);
+	}
+}
 
 void getSurfRotation(const Mat& ref_color, const Mat& rot_color, Mat& H) {
 	Mat img_ref, img_rot; 
@@ -122,13 +215,22 @@ void getBinaryCloudMask(const Mat& img, Mat& bright, Mat& binary) {
 	// Dynamic thresholding to binary by minimizing within-class variance 
 	threshold(diff, binary, 0, 255, THRESH_BINARY | THRESH_OTSU);
 }
+const Size FINAL_SIZE = Size(1280, 720);
+
+// Downscale images if using original 4K footage
+void downscale(Mat& old_frame, Mat& new_frame) {
+	pyrDown(old_frame, new_frame);
+	pyrDown(new_frame, new_frame);
+	resize(new_frame, new_frame, FINAL_SIZE);
+}
 
 int main(int argc, char** argv) {
 	VideoCapture cap;
 	cap.open(VIDEO_PATH);
+	cout << "SDLKJFLKDSJF" << endl;
 	if (!cap.isOpened())
 		return -1;
-
+	cout << "WHLJELKSJDF";
 	int num_frames = static_cast<int>(cap.get(CAP_PROP_FRAME_COUNT));
     cout << num_frames << " frames." << endl;
 
@@ -137,8 +239,6 @@ int main(int argc, char** argv) {
 	//imwrite("D:/NIFA/frame1.JPG", frame1);
 	//return 0;
 
-	cap.set(CAP_PROP_POS_FRAMES, 3300);
-	//cap.set(CAP_PROP_POS_FRAMES, 7500);
 	//cap.set(CAP_PROP_POS_FRAMES, 6000);
 	int	count = 1;
 
@@ -146,8 +246,10 @@ int main(int argc, char** argv) {
 
 	// Extract first frame as reference
 	cap >> frame;
-	pyrDown(frame, frame);
-	resize(frame, frame, Size(frame.cols / RESIZE_FACTOR, frame.rows / RESIZE_FACTOR));
+	if (frame.size() != FINAL_SIZE) {
+		downscale(frame, frame);
+	}
+
 	img_ref = frame.clone();
 
 	Mat hsv, brightest, binary;
@@ -156,82 +258,118 @@ int main(int argc, char** argv) {
 	cvtColor(img_ref, hsv, COLOR_BGR2HSV);
 	split(hsv, hsv_channels);
 	brightest = hsv_channels[2];
-
-	//imshow("Reference", img_ref);
+	cout << "HELLO";
 	VideoWriter video;
 	int codec = VideoWriter::fourcc('M', 'J', 'P', 'G');
 	double fps = 10;
-	video.open("D:/NIFA/rotation.avi", codec, fps, Size(1280, 720), true);
+	video.open("E:/NIFA/datasets/grand_meadow_0001_all.avi", codec, fps, FINAL_SIZE, true);
+
+	FileStorage fs(OMNI_MODEL_PATH, FileStorage::READ);
+	Mat K, D, xi;
+	fs["cameraMatrix"] >> K;
+	fs["D"] >> D;
+	fs["xi"] >> xi;
+
+	Mat world_coords, rvec, tvec;
+	vector<Point2f> pixel_coords, sampling_coords;
+	vector<Point2d> new_pixel_coords;
+	markFiducials(world_coords, pixel_coords);
+	estimateCameraPose(world_coords, pixel_coords, K, D, rvec, tvec, new_pixel_coords);
+
+	//// elgin
+	//Point3f min_corner = Point3f(44.1285, -92.296, 0);
+	//Point3f max_corner = Point3f(44.1303, -92.293, 0);
+
+	//// becker
+	//Point3f min_corner = Point3f(45.344873, -93.860312, 0);
+	//Point3f max_corner = Point3f(45.347070, -93.857618, 0);
+
+	// grand_meadow
+	Point3f min_corner = Point3f(43.622596, -92.561403, 0);
+	Point3f max_corner = Point3f(43.621269, -92.564, 0);
+
+	Mat sampling_region = img_ref.clone();
+	getSamplingRegion(sampling_region, min_corner, max_corner, Size(1000, 1400), K, D, rvec, tvec, true, sampling_coords);
 
 	while (1) {
 		cap >> frame;
 
-		if (++count % 30 == 2) {
+		if (++count % 30 == 2 && count < 1000) {
 
 			cout << "Processing frame #" << count << endl;
 
 			if (frame.empty())
 				break;
-			pyrDown(frame, frame);
-			//pyrDown(frame, frame);
 
-			resize(frame, frame, Size(frame.cols / RESIZE_FACTOR, frame.rows / RESIZE_FACTOR));
-
-			if (count % 30 == 2) {
-				getSurfRotation(img_ref, frame, H);
+			if (frame.size() != FINAL_SIZE) {
+				downscale(frame, frame);
 			}
+
+			getSurfRotation(img_ref, frame, H);
 
 			//warpPerspective(frame, img_rot, H, img_ref.size());
 			warpAffine(frame, img_rot, H, img_ref.size());
-
+			
 			//imshow("Unrectified", frame);
 			//imshow("Rectified", img_rot);
 
+			//cout << img_rot.size() << endl;
+			//cout << brightest.size() << endl;
+			//cout << binary.size() << endl;
+
+			//if (img_rot.size() != FINAL_SIZE) {
+			//	downscale(img_rot, img_rot);
+			//}
+
 			getBinaryCloudMask(img_rot, brightest, binary);
-			medianBlur(binary, binary, 7);
-
-			//imshow("Binary Cloud Mask", binary);
-
-			//if (count == 2) {
-			//	imwrite(ROT_REF_PATH, frame);
-			//}
-			//if (count == 1350) {
-			//	imwrite(ROT_ROTATED_PATH, frame);
-			//	break;
-			//}
-
-			/*FileStorage fs(OMNI_MODEL_PATH, FileStorage::READ);
-			Mat K, D, xi;
-			fs["cameraMatrix"] >> K;
-			fs["D"] >> D;
-			fs["xi"] >> xi;
-
-			Mat v1, v2, v3, v4, row1, row2, canvas;
-			omnidir::undistortImage(img_ref, v1, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
-			omnidir::undistortImage(frame, v2, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
-			omnidir::undistortImage(img_rot, v3, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
-			omnidir::undistortImage(binary, v4, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
-
-			hconcat(v1, v2, row1);
-			cvtColor(v4, v4, COLOR_GRAY2RGB);
-			hconcat(v3, v4, row2);
-			vconcat(row1, row2, canvas);*/
+			medianBlur(binary, binary, 31);
 
 			cvtColor(binary, binary, COLOR_GRAY2RGB);
 
+			getRegisteredImage(img_rot, sampling_coords, false, img_rot);
+			getRegisteredImage(binary, sampling_coords, false, binary);
+
+			if (img_rot.size() != FINAL_SIZE) {
+				downscale(img_rot, img_rot);
+			}
+
+			if (binary.size() != FINAL_SIZE) {
+				downscale(binary, binary);
+			}
+
+			//imshow("Binary Cloud Mask", binary);
+
+			//Mat v1, v2, v3, v4, row1, row2, canvas;
+			//omnidir::undistortImage(img_ref, v1, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
+			//omnidir::undistortImage(frame, v2, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
+			//omnidir::undistortImage(img_rot, v3, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
+			//omnidir::undistortImage(binary, v4, K, D, xi, omnidir::RECTIFY_PERSPECTIVE);
+
+			//hconcat(v1, v2, row1);
+			//cvtColor(v4, v4, COLOR_GRAY2RGB);
+			//hconcat(v3, v4, row2);
+			//vconcat(row1, row2, canvas);
+
 			Mat row1, row2, canvas;
-			hconcat(img_ref, frame, row1);
+			hconcat(sampling_region, frame, row1);
 			hconcat(img_rot, binary, row2);
 			vconcat(row1, row2, canvas);
+			if (canvas.size() != FINAL_SIZE) {
+				downscale(canvas, canvas);
+			}
+			
 
-			pyrDown(canvas, canvas);
 			//pyrDown(canvas, canvas);
 			//pyrDown(canvas, canvas);
-			//resize(canvas, canvas, Size(canvas.cols / 8, canvas.rows / 8));
-			imshow("canvas", canvas);
-			//cout << canvas.size << endl;
+			//resize(canvas, canvas, Size(canvas.cols / RESIZE_FACTOR, canvas.rows / RESIZE_FACTOR));
+			//imshow("canvas", canvas);
+			////cout << canvas.size << endl;
+			imshow("wow", canvas);
 
 			video << canvas;
+		}
+		else if(count >= 1000) {
+			break;
 		}
 
 		//img_ref, frame, img_rot, binary
@@ -278,7 +416,7 @@ int main(int argc, char** argv) {
 
 	return 0;
 }
-
+//
 //#include "opencv2/video/tracking.hpp"
 //#include "opencv2/imgproc.hpp"
 //#include "opencv2/videoio.hpp"
